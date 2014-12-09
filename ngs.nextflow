@@ -1,0 +1,113 @@
+#!/usr/bin/env nextflow
+
+params.pair1 = "$HOME/Projects/nextflow-test/reads/*_R1.fastq.gz"
+params.pair2 = "$HOME/Projects/nextflow-test/reads/*_R2.fastq.gz"
+params.genome = "$HOME/Data/Resource/hg19/human_g1k_v37.fasta"
+
+// For both left and right reads get triples (readID, runID, UnixFile).
+reads1 = Channel
+    .fromPath( params.pair1 )
+    .map { path -> [ path.toString().replace("_R1", "_RX"), path ] }
+reads2 = Channel
+    .fromPath( params.pair2 )
+    .map { path -> [ path.toString().replace("_R2", "_RX"), path ] }
+// Join pairs on their key.
+read_pairs = reads1
+        .phase(reads2)
+        .map { pair1, pair2 -> [ pathToDatasetID(pair1[1]), pair1[1], pair2[1] ] }
+
+// Get the genome file.
+genome_file = file(params.genome)
+
+//
+// Step 1. Map the reads using bwa.
+//
+
+process mapping {
+    echo true
+
+    cpus params.cpus.mapping
+    // module 'bwa/0.7.2'
+
+    input:
+    set dataset_id, file(read1), file(read2) from read_pairs
+
+    output:
+    set dataset_id, file('alignment.bam') into bam_files
+
+    """
+    bwa mem -R '@RG\tID:${params.run_id}\tSM:${params.run_id}' -t ${params.cpus.mapping} ${genome_file} ${read1} ${read2} | samtools view -Sb - | samtools sort - alignment
+    """
+}
+
+// Collect all alignments with the same dataset_id.
+joint_bams = bam_files.groupTuple()
+
+//
+// Step 2. Merge the BAM files and index result.
+//
+
+process merging {
+  echo true
+  cpus params.cpus.merging
+
+  input:
+  set dataset_id, bams from joint_bams
+
+  output:
+  file finalAlignmentPath() into final_alignment
+  file finalAlignmentPath(".bai") into final_alignment_bai
+   
+
+  """
+  mkdir -p `dirname ${finalAlignmentPath()}`
+  samtools merge -f ${finalAlignmentPath()} ${bams.join(" ")}
+  samtools index ${finalAlignmentPath()}
+  """
+}
+
+//
+// Step 3. Perform Variant Calling.
+//
+
+process variant_calling {
+  echo true
+  cpus params.cpus.variant_calling
+
+  input:
+  file final_alignment
+  file final_alignment_bai
+
+  output:
+  file finalVariantsPath() into final_vcf
+
+  """
+  mkdir -p `dirname ${finalVariantsPath()}`
+  samtools mpileup -uf ${params.genome} ${final_alignment} | bcftools view -vcg - > ${finalVariantsPath()}
+  """
+}
+
+//java -Xmx32G -Djava.io.tmpdir=${params.tmpdir} -jar $HOME/local/GenomeAnalysisTK-3.3-0/GenomeAnalysisTK.jar -R ${params.genome} -T HaplotypeCaller --emitRefConfidence GVCF --variant_index_type LINEAR --variant_index_parameter 128000 --dbsnp ${params.db_snp} -I ${final_alignment} -o ${finalVariantsPath()}
+
+//final_vcf.subscribe onNext: { println "FINAL VCF\t" + it }, onComplete { println 'Done.' }
+
+/**
+ * @return path to final VCF file.
+ */
+def finalVariantsPath() {
+  return [params.target_dir, 'vcf', params.run_id + '.vcf'].join(File.separator)
+}
+
+/**
+ * @return path to final alignment directory
+ */
+def finalAlignmentPath(ext = "") {
+  return [params.target_dir, 'bam', params.run_id + '.bam' + ext].join(File.separator)
+}
+
+/**
+ * @return String with the path to the parent of <code>path</code>.
+ */
+def pathToDatasetID(path) {
+  return path.getParent().toString();
+}
